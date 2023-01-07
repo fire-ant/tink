@@ -11,8 +11,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
-	"github.com/tinkerbell/tink/client"
 	"github.com/tinkerbell/tink/cmd/tink-worker/worker"
+	"github.com/tinkerbell/tink/internal/client"
 	"github.com/tinkerbell/tink/protos/workflow"
 )
 
@@ -130,7 +130,6 @@ func initViper(logger log.Logger, cmd *cobra.Command) error {
 			logger.With("configFile", viper.ConfigFileUsed()).Error(err, "could not load config file")
 			return err
 		}
-		logger.Info("no config file found")
 	} else {
 		logger.With("configFile", viper.ConfigFileUsed()).Info("loaded config file")
 	}

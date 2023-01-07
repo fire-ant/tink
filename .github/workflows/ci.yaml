@@ -1,4 +1,4 @@
-name: For each commit and PR
+name: Tink
 on:
   push:
     branches:
@@ -8,168 +8,109 @@ on:
   pull_request:
 env:
   CGO_ENABLED: 0
-
+  GO_VERSION: 1.18
 jobs:
   verify:
+    name: Verify
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-
-      - name: Install Go
-        uses: actions/setup-go@v2
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v3
         with:
-          go-version: "1.18.5"
-
-      - name: make verify
-        run: make verify
+          go-version: "${{ env.GO_VERSION }}"
+      - run: make verify
   test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-
-      - name: Install Go
-        uses: actions/setup-go@v2
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v3
         with:
-          go-version: "1.18.5"
-
+          go-version: "${{ env.GO_VERSION }}"
       - name: Install nix
-        uses: cachix/install-nix-action@v16
+        uses: cachix/install-nix-action@v18
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-
-      - name: Fetch Nix Packages
+      - name: Install required nix packages
         run: nix-shell --run 'true'
-
-      - name: Generate
-        run: nix-shell --run 'make generate'
-
-      - name: e2etest
-        run: make e2etest-setup
-
-      - name: go test
-        run: make test
-
-      - name: upload codecov
+      - run: make test
+      - name: Upload codecov
         run: bash <(curl -s https://codecov.io/bash)
-  ci-checks:
+  checks:
+    name: CI Checks
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-
+      - uses: actions/checkout@v3
       - name: Install nix
-        uses: cachix/install-nix-action@v16
+        uses: cachix/install-nix-action@v18
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-
-      - name: Fetch Nix Packages
-        run: nix-shell --run 'true'
-
-      - run: make bin/gofumpt
-
+      - run: nix-shell --run 'true'
       - run: PATH=$PWD/bin/:$PATH ./ci-checks.sh
-  crosscompile:
+  # We preemptively build the binaries for efficiency instead of waiting on unit tests to pass
+  # hence this doesn't depend on anything.
+  build:
+    name: Build
     runs-on: ubuntu-latest
-    needs:
-      - ci-checks
-      - test
-      - verify
+    strategy:
+      matrix:
+        platform: [amd64, arm64]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-
-      - name: Install Go
-        uses: actions/setup-go@v2
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v3
         with:
-          go-version: "1.18.5"
-
-      - run: make crosscompile -j$(nproc)
-
-      - name: Upload tink-cli binaries
-        uses: actions/upload-artifact@v2
+          go-version: "${{ env.GO_VERSION }}"
+      - name: Build linux/${{ matrix.platform }}
+        run: make build -j$(nproc) GOOS=linux GOARCH=${{ matrix.platform }}
+      - uses: actions/upload-artifact@v3
         with:
-          name: tink-cli
-          path: cmd/tink-cli/tink-cli-*
-
-      - name: Upload tink-server binaries
-        uses: actions/upload-artifact@v2
-        with:
-          name: tink-server
-          path: cmd/tink-server/tink-server-*
-
-      - name: Upload tink-worker binaries
-        uses: actions/upload-artifact@v2
-        with:
-          name: tink-worker
-          path: cmd/tink-worker/tink-worker-*
-
-      - name: Upload virtual-worker binaries
-        uses: actions/upload-artifact@v2
-        with:
-          name: virtual-worker
-          path: cmd/virtual-worker/virtual-worker-*
-
-      - name: Upload tink-controller binaries
-        uses: actions/upload-artifact@v2
-        with:
-          name: tink-controller
-          path: cmd/tink-controller/tink-controller-*
-  docker-images:
+          name: binaries
+          path: bin/*
+  package:
+    name: Package
     runs-on: ubuntu-latest
     needs:
-      - crosscompile
+      - verify
+      - test
+      - checks
+      - build
     strategy:
       matrix:
         include:
-          - repository: quay.io/tinkerbell/tink-cli
-            binary: tink-cli
-
           - repository: quay.io/tinkerbell/tink
             binary: tink-server
-
           - repository: quay.io/tinkerbell/tink-worker
             binary: tink-worker
-
           - repository: quay.io/tinkerbell/tink-controller
             binary: tink-controller
     steps:
-      - name: Docker Image Tag for Sha
+      - name: Create docker image tags
         id: docker-image-tag
-        run: |
-          echo ::set-output name=tags::${{ matrix.repository }}:latest,${{ matrix.repository }}:sha-${GITHUB_SHA::8}
-
-      - name: Checkout code
-        uses: actions/checkout@v2
-
+        run: echo ::set-output name=tags::${{ matrix.repository }}:latest,${{ matrix.repository }}:sha-${GITHUB_SHA::8}
+      - uses: actions/checkout@v3
       - name: Login to quay.io
-        uses: docker/login-action@v1
+        uses: docker/login-action@v2
         if: ${{ startsWith(github.ref, 'refs/heads/main') }}
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_USERNAME }}
           password: ${{ secrets.QUAY_PASSWORD }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-
-      - name: Download ${{ matrix.binary }} artifacts
+        uses: docker/setup-buildx-action@v2
+      - name: Download all binaries
         uses: actions/download-artifact@v2
         with:
-          name: ${{ matrix.binary}}
-          path: cmd/${{ matrix.binary }}
-
-      - name: Fix Permissions
-        run: chmod +x cmd/${{ matrix.binary }}/${{ matrix.binary }}*
-
-      - name: ${{ matrix.repository }}
-        uses: docker/build-push-action@v2
+          name: binaries
+          path: ./bin
+      # Artifact upload doesn't preserve permissions so we need to fix them before use in
+      # the Dockerfiles.
+      - name: Fix permissions
+        run: chmod +x bin/*
+      - name: Build ${{ matrix.repository }} and push
+        uses: docker/build-push-action@v3
         with:
-          context: cmd/${{ matrix.binary }}/
+          context: .
+          file: cmd/${{ matrix.binary }}/Dockerfile
           cache-from: type=registry,ref=${{ matrix.repository }}:latest
           push: ${{ startsWith(github.ref, 'refs/heads/main') }}
           tags: ${{ steps.docker-image-tag.outputs.tags }}

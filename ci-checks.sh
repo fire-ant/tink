@@ -12,7 +12,7 @@ if ! git ls-files '*.sh' '*.go' '*.md' | xargs codespell -q 3 -I .codespell-whit
 fi
 
 # --check doesn't show what line number fails, so write the result to disk for the diff to catch
-if ! git ls-files '*.yaml' '*.yml' '*.json' '*.md' | xargs prettier --list-different --write; then
+if ! git ls-files '*.json' '*.md' | xargs prettier --list-different --write; then
 	failed=1
 fi
 
@@ -25,10 +25,6 @@ if ! git ls-files '*.sh' | xargs shellcheck; then
 fi
 
 if ! nixfmt shell.nix; then
-	failed=1
-fi
-
-if ! git ls-files '*.go' | xargs -I% sh -c 'sed -i "/^import (/,/^)/ { /^\s*$/ d }" % && gofumpt -w -s %'; then
 	failed=1
 fi
 

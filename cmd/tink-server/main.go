@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -15,13 +14,9 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
-	"github.com/tinkerbell/tink/cmd/tink-server/internal"
-	grpcserver "github.com/tinkerbell/tink/grpc-server"
-	httpserver "github.com/tinkerbell/tink/http-server"
-	"github.com/tinkerbell/tink/metrics"
-	"github.com/tinkerbell/tink/server"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
+	"github.com/tinkerbell/tink/internal/grpcserver"
+	"github.com/tinkerbell/tink/internal/httpserver"
+	"github.com/tinkerbell/tink/internal/server"
 )
 
 // version is set at build time.
@@ -31,15 +26,8 @@ var version = "devel"
 // You can change the configuration via environment variable, or file, or command flags.
 type DaemonConfig struct {
 	Facility      string
-	PGDatabase    string
-	PGUSer        string
-	PGPassword    string
-	PGSSLMode     string
-	OnlyMigration bool
 	GRPCAuthority string
-	CertDir       string
 	HTTPAuthority string
-	TLS           bool
 	Backend       string
 
 	KubeconfigPath string
@@ -47,27 +35,17 @@ type DaemonConfig struct {
 	KubeNamespace  string
 }
 
-const (
-	backendPostgres   = "postgres"
-	backendKubernetes = "kubernetes"
-)
+const backendKubernetes = "kubernetes"
 
 func backends() []string {
-	return []string{backendPostgres, backendKubernetes}
+	return []string{backendKubernetes}
 }
 
 func (c *DaemonConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&c.Facility, "facility", "deprecated", "This is temporary. It will be removed")
-	fs.StringVar(&c.PGDatabase, "postgres-database", "tinkerbell", "The Postgres database name. Only takes effect if `--backend=postgres`")
-	fs.StringVar(&c.PGUSer, "postgres-user", "tinkerbell", "The Postgres database username. Only takes effect if `--backend=postgres`")
-	fs.StringVar(&c.PGPassword, "postgres-password", "tinkerbell", "The Postgres database password. Only takes effect if `--backend=postgres`")
-	fs.StringVar(&c.PGSSLMode, "postgres-sslmode", "disable", "Enable or disable SSL mode in postgres. Only takes effect if `--backend=postgres`")
-	fs.BoolVar(&c.OnlyMigration, "only-migration", false, "When enabled the server applies the migration to postgres database and it exits. Only takes effect if `--backend=postgres`")
 	fs.StringVar(&c.GRPCAuthority, "grpc-authority", ":42113", "The address used to expose the gRPC server")
-	fs.StringVar(&c.CertDir, "cert-dir", "", "")
 	fs.StringVar(&c.HTTPAuthority, "http-authority", ":42114", "The address used to expose the HTTP server")
-	fs.BoolVar(&c.TLS, "tls", true, "Run in tls protected mode (disabling should only be done for development or if behind TLS terminating proxy)")
-	fs.StringVar(&c.Backend, "backend", backendPostgres, fmt.Sprintf("The backend datastore to use. Must be one of %s", strings.Join(backends(), ", ")))
+	fs.StringVar(&c.Backend, "backend", backendKubernetes, fmt.Sprintf("The backend datastore to use. Must be one of %s", strings.Join(backends(), ", ")))
 	fs.StringVar(&c.KubeconfigPath, "kubeconfig", "", "The path to the Kubeconfig. Only takes effect if `--backend=kubernetes`")
 	fs.StringVar(&c.KubeAPI, "kubernetes", "", "The Kubernetes API URL, used for in-cluster client construction. Only takes effect if `--backend=kubernetes`")
 	fs.StringVar(&c.KubeNamespace, "kube-namespace", "", "The Kubernetes namespace to target")
@@ -75,17 +53,8 @@ func (c *DaemonConfig) AddFlags(fs *pflag.FlagSet) {
 
 func (c *DaemonConfig) PopulateFromLegacyEnvVar() {
 	c.Facility = env.Get("FACILITY", c.Facility)
-
-	c.PGDatabase = env.Get("PGDATABASE", c.PGDatabase)
-	c.PGUSer = env.Get("PGUSER", c.PGUSer)
-	c.PGPassword = env.Get("PGPASSWORD", c.PGPassword)
-	c.PGSSLMode = env.Get("PGSSLMODE", c.PGSSLMode)
-	c.OnlyMigration = env.Bool("ONLY_MIGRATION", c.OnlyMigration)
-
-	c.CertDir = env.Get("TINKERBELL_CERTS_DIR", c.CertDir)
 	c.GRPCAuthority = env.Get("TINKERBELL_GRPC_AUTHORITY", c.GRPCAuthority)
 	c.HTTPAuthority = env.Get("TINKERBELL_HTTP_AUTHORITY", c.HTTPAuthority)
-	c.TLS = env.Bool("TINKERBELL_TLS", c.TLS)
 }
 
 func main() {
@@ -125,7 +94,6 @@ func NewRootCommand(config *DaemonConfig, logger log.Logger) *cobra.Command {
 			// the most aggressive way we have to guarantee that
 			// the old way works as before.
 			config.PopulateFromLegacyEnvVar()
-			metrics.SetupMetrics(config.Facility, logger)
 
 			logger.Info("starting version " + version)
 
@@ -137,22 +105,8 @@ func NewRootCommand(config *DaemonConfig, logger log.Logger) *cobra.Command {
 			// graceful shutdown and error management but I want to
 			// figure this out in another PR
 			errCh := make(chan error, 2)
-			var (
-				registrar grpcserver.Registrar
-				grpcOpts  []grpc.ServerOption
-				err       error
-			)
-			if config.TLS {
-				certDir := config.CertDir
-				if certDir == "" {
-					certDir = env.Get("TINKERBELL_CERTS_DIR", filepath.Join("/certs", config.Facility))
-				}
-				cert, err := grpcserver.GetCerts(certDir)
-				if err != nil {
-					return err
-				}
-				grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewServerTLSFromCert(cert)))
-			}
+			var registrar grpcserver.Registrar
+
 			switch config.Backend {
 			case backendKubernetes:
 				var err error
@@ -165,42 +119,17 @@ func NewRootCommand(config *DaemonConfig, logger log.Logger) *cobra.Command {
 				if err != nil {
 					return err
 				}
-			case backendPostgres:
-				// TODO(gianarb): I moved this up because we need to be sure that both
-				// connection, the one used for the resources and the one used for
-				// listening to events and notification are coming in the same way.
-				// BUT we should be using the right flags
-				connInfo := fmt.Sprintf("dbname=%s user=%s password=%s sslmode=%s",
-					config.PGDatabase,
-					config.PGUSer,
-					config.PGPassword,
-					config.PGSSLMode,
-				)
-				database, err := internal.SetupPostgres(connInfo, config.OnlyMigration, logger)
-				if err != nil {
-					return err
-				}
-				if config.OnlyMigration {
-					return nil
-				}
-
-				registrar, err = server.NewDBServer(
-					logger,
-					database,
-				)
-				if err != nil {
-					return err
-				}
 			default:
 				return fmt.Errorf("invalid backend: %s", config.Backend)
 			}
+
 			// Start the gRPC server in the background
 			addr, err := grpcserver.SetupGRPC(
 				ctx,
 				registrar,
 				config.GRPCAuthority,
-				grpcOpts,
-				errCh)
+				errCh,
+			)
 			if err != nil {
 				return err
 			}
@@ -209,7 +138,7 @@ func NewRootCommand(config *DaemonConfig, logger log.Logger) *cobra.Command {
 			httpserver.SetupHTTP(ctx, logger, config.HTTPAuthority, errCh)
 
 			select {
-			case err = <-errCh:
+			case err := <-errCh:
 				logger.Error(err)
 			case sig := <-sigs:
 				logger.With("signal", sig.String()).Info("signal received, stopping servers")

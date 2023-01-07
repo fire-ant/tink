@@ -2,25 +2,17 @@ package worker
 
 import (
 	"context"
-	sha "crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/packethost/pkg/log"
 	"github.com/pkg/errors"
 	pb "github.com/tinkerbell/tink/protos/workflow"
-	"google.golang.org/grpc/status"
 )
 
 const (
-	dataFile       = "data"
 	defaultDataDir = "/worker"
 
 	errGetWfContext       = "failed to get workflow context"
@@ -33,11 +25,6 @@ const (
 type loggingContext string
 
 var loggingContextKey loggingContext = "logger"
-
-var (
-	workflowcontexts = map[string]*pb.WorkflowContext{}
-	workflowDataSHA  = map[string]string{}
-)
 
 // WorkflowMetadata is the metadata related to workflow data.
 type WorkflowMetadata struct {
@@ -173,7 +160,7 @@ func (w *Worker) execute(ctx context.Context, wfID string, action *pb.WorkflowAc
 		return pb.State_STATE_RUNNING, errors.Wrap(err, "create container")
 	}
 
-	l.With("containerID", id, "command", action.GetOnTimeout()).Info("container created")
+	l.With("containerID", id, "command", action.Command).Info("container created")
 
 	var timeCtx context.Context
 	var cancel context.CancelFunc
@@ -260,20 +247,42 @@ func (w *Worker) executeReaction(ctx context.Context, reaction string, cmd []str
 // ProcessWorkflowActions gets all Workflow contexts and processes their actions.
 func (w *Worker) ProcessWorkflowActions(ctx context.Context) error {
 	l := w.logger.With("workerID", w.workerID)
+	l.Info("starting to process workflow actions")
 
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		res, err := w.tinkClient.GetWorkflowContexts(ctx, &pb.WorkflowContextRequest{WorkerId: w.workerID})
 		if err != nil {
-			return errors.Wrap(err, errGetWfContext)
+			l.Error(errors.Wrap(err, errGetWfContext))
+			<-time.After(w.retryInterval)
+			continue
 		}
-		for wfContext, err := res.Recv(); err == nil && wfContext != nil; wfContext, err = res.Recv() {
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+			wfContext, err := res.Recv()
+			if err != nil || wfContext == nil {
+				if !errors.Is(err, io.EOF) {
+					l.Info(err)
+				}
+				<-time.After(w.retryInterval)
+				break
+			}
 			wfID := wfContext.GetWorkflowId()
 			l = l.With("workflowID", wfID)
 			ctx := context.WithValue(ctx, loggingContextKey, &l)
 
 			actions, err := w.tinkClient.GetWorkflowActions(ctx, &pb.WorkflowActionsRequest{WorkflowId: wfID})
 			if err != nil {
-				return errors.Wrap(err, errGetWfActions)
+				l.Error(errors.Wrap(err, errGetWfActions))
+				continue
 			}
 
 			turn := false
@@ -305,35 +314,8 @@ func (w *Worker) ProcessWorkflowActions(ctx context.Context) error {
 				}
 			}
 
-			if turn {
-				wfDir := filepath.Join(w.dataDir, wfID)
-				l := l.With("actionName", actions.GetActionList()[actionIndex].GetName(),
-					"taskName", actions.GetActionList()[actionIndex].GetTaskName(),
-				)
-				if _, err := os.Stat(wfDir); os.IsNotExist(err) {
-					err := os.MkdirAll(wfDir, os.FileMode(0o755))
-					if err != nil {
-						l.Error(err)
-						os.Exit(1)
-					}
-
-					f := openDataFile(wfDir, l)
-					_, err = f.Write([]byte("{}"))
-					if err != nil {
-						l.Error(err)
-						os.Exit(1)
-					}
-
-					err = f.Close()
-					if err != nil {
-						l.Error(err)
-						os.Exit(1)
-					}
-				}
-				l.Info("starting action")
-			}
-
 			for turn {
+				l.Info("starting action")
 				action := actions.GetActionList()[actionIndex]
 				l := l.With(
 					"actionName", action.GetName(),
@@ -350,15 +332,9 @@ func (w *Worker) ProcessWorkflowActions(ctx context.Context) error {
 						Message:      "Started execution",
 						WorkerId:     action.GetWorkerId(),
 					}
-					err := w.reportActionStatus(ctx, actionStatus)
-					if err != nil {
-						exitWithGrpcError(err, l)
-					}
+					w.reportActionStatus(ctx, l, actionStatus)
 					l.With("status", actionStatus.ActionStatus, "duration", strconv.FormatInt(actionStatus.Seconds, 10)).Info("sent action status")
 				}
-
-				// get workflow data
-				w.getWorkflowData(ctx, wfID)
 
 				// start executing the action
 				start := time.Now()
@@ -381,28 +357,17 @@ func (w *Worker) ProcessWorkflowActions(ctx context.Context) error {
 					}
 					l = l.With("actionStatus", actionStatus.ActionStatus.String())
 					l.Error(err)
-					if reportErr := w.reportActionStatus(ctx, actionStatus); reportErr != nil {
-						exitWithGrpcError(reportErr, l)
-					}
-					delete(workflowcontexts, wfID)
-					return err
+					w.reportActionStatus(ctx, l, actionStatus)
+					break
 				}
 
 				actionStatus.ActionStatus = pb.State_STATE_SUCCESS
 				actionStatus.Message = "finished execution successfully"
-
-				err = w.reportActionStatus(ctx, actionStatus)
-				if err != nil {
-					exitWithGrpcError(err, l)
-				}
+				w.reportActionStatus(ctx, l, actionStatus)
 				l.Info("sent action status")
-
-				// send workflow data, if updated
-				w.updateWorkflowData(ctx, actionStatus)
 
 				if len(actions.GetActionList()) == actionIndex+1 {
 					l.Info("reached to end of workflow")
-					delete(workflowcontexts, wfID)
 					turn = false
 					break
 				}
@@ -421,154 +386,21 @@ func (w *Worker) ProcessWorkflowActions(ctx context.Context) error {
 	}
 }
 
-func exitWithGrpcError(err error, l log.Logger) {
-	if err != nil {
-		errStatus, _ := status.FromError(err)
-		l.With("errorCode", errStatus.Code()).Error(err)
-		os.Exit(1)
-	}
-}
-
 func isLastAction(wfContext *pb.WorkflowContext, actions *pb.WorkflowActionList) bool {
 	return int(wfContext.GetCurrentActionIndex()) == len(actions.GetActionList())-1
 }
 
-func (w *Worker) reportActionStatus(ctx context.Context, actionStatus *pb.WorkflowActionStatus) error {
-	l := w.getLogger(ctx).With("workflowID", actionStatus.GetWorkflowId(),
-		"workerID", actionStatus.GetWorkerId(),
-		"actionName", actionStatus.GetActionName(),
-		"taskName", actionStatus.GetTaskName(),
-		"status", actionStatus.ActionStatus,
-	)
-	var err error
-	for r := 1; r <= w.retries; r++ {
+// reportActionStatus reports the status of an action to the Tinkerbell server and retries forever on error.
+func (w *Worker) reportActionStatus(ctx context.Context, l log.Logger, actionStatus *pb.WorkflowActionStatus) {
+	for {
 		l.Info("reporting Action Status")
-		_, err = w.tinkClient.ReportActionStatus(ctx, actionStatus)
+		_, err := w.tinkClient.ReportActionStatus(ctx, actionStatus)
 		if err != nil {
 			l.Error(errors.Wrap(err, errReportActionStatus))
 			<-time.After(w.retryInterval)
 
 			continue
 		}
-		return nil
+		return
 	}
-	return err
-}
-
-func (w *Worker) getWorkflowData(ctx context.Context, workflowID string) {
-	l := w.getLogger(ctx).With("workflowID", workflowID,
-		"workerID", w.workerID,
-	)
-	res, err := w.tinkClient.GetWorkflowData(ctx, &pb.GetWorkflowDataRequest{WorkflowId: workflowID})
-	if err != nil {
-		l.Error(err)
-	}
-
-	if len(res.GetData()) != 0 {
-		wfDir := filepath.Join(w.dataDir, workflowID)
-		f := openDataFile(wfDir, l)
-		defer func() {
-			if err := f.Close(); err != nil {
-				l.With("file", f.Name()).Error(err)
-			}
-		}()
-
-		_, err := f.Write(res.GetData())
-		if err != nil {
-			l.Error(err)
-		}
-		h := sha.New()
-		workflowDataSHA[workflowID] = base64.StdEncoding.EncodeToString(h.Sum(res.Data))
-	}
-}
-
-func (w *Worker) updateWorkflowData(ctx context.Context, actionStatus *pb.WorkflowActionStatus) {
-	l := w.getLogger(ctx).With("workflowID", actionStatus.GetWorkflowId,
-		"workerID", actionStatus.GetWorkerId(),
-		"actionName", actionStatus.GetActionName(),
-		"taskName", actionStatus.GetTaskName(),
-	)
-
-	wfDir := filepath.Join(w.dataDir, actionStatus.GetWorkflowId())
-	f := openDataFile(wfDir, l)
-	defer func() {
-		if err := f.Close(); err != nil {
-			l.With("file", f.Name()).Error(err)
-		}
-	}()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		l.Error(err)
-	}
-
-	if isValidDataFile(f, w.maxSize, data, l) {
-		h := sha.New()
-		if _, ok := workflowDataSHA[actionStatus.GetWorkflowId()]; !ok {
-			checksum := base64.StdEncoding.EncodeToString(h.Sum(data))
-			workflowDataSHA[actionStatus.GetWorkflowId()] = checksum
-			w.sendUpdate(ctx, actionStatus, data, checksum)
-		} else {
-			newSHA := base64.StdEncoding.EncodeToString(h.Sum(data))
-			if !strings.EqualFold(workflowDataSHA[actionStatus.GetWorkflowId()], newSHA) {
-				w.sendUpdate(ctx, actionStatus, data, newSHA)
-			}
-		}
-	}
-}
-
-func (w *Worker) sendUpdate(ctx context.Context, st *pb.WorkflowActionStatus, data []byte, checksum string) {
-	l := w.getLogger(ctx).With("workflowID", st.GetWorkflowId,
-		"workerID", st.GetWorkerId(),
-		"actionName", st.GetActionName(),
-		"taskName", st.GetTaskName(),
-	)
-	meta := WorkflowMetadata{
-		WorkerID:  st.GetWorkerId(),
-		Action:    st.GetActionName(),
-		Task:      st.GetTaskName(),
-		UpdatedAt: time.Now(),
-		SHA:       checksum,
-	}
-	metadata, err := json.Marshal(meta)
-	if err != nil {
-		l.Error(err)
-		os.Exit(1)
-	}
-
-	_, err = w.tinkClient.UpdateWorkflowData(ctx, &pb.UpdateWorkflowDataRequest{
-		WorkflowId: st.GetWorkflowId(),
-		Data:       data,
-		Metadata:   metadata,
-	})
-	if err != nil {
-		l.Error(err)
-		os.Exit(1)
-	}
-}
-
-func openDataFile(wfDir string, l log.Logger) *os.File {
-	f, err := os.OpenFile(filepath.Clean(wfDir+string(os.PathSeparator)+dataFile), os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		l.Error(err)
-		os.Exit(1)
-	}
-	return f
-}
-
-func isValidDataFile(f *os.File, maxSize int64, data []byte, l log.Logger) bool {
-	var dataMap map[string]interface{}
-	err := json.Unmarshal(data, &dataMap)
-	if err != nil {
-		l.Error(err)
-		return false
-	}
-
-	stat, err := f.Stat()
-	if err != nil {
-		l.Error(err)
-		return false
-	}
-
-	return stat.Size() <= maxSize
 }
